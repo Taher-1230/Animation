@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Gesture Particles with Trails</title>
+    <style>
+        body { margin: 0; overflow: hidden; background: #000; font-family: 'Segoe UI', sans-serif; }
+        #ui {
+            position: absolute; top: 20px; left: 20px; color: white;
+            background: rgba(0,0,0,0.6); padding: 15px; border-radius: 8px;
+            pointer-events: none; border: 1px solid rgba(255,255,255,0.1);
+            backdrop-filter: blur(5px);
+        }
+        canvas { display: block; }
+        video { display: none; }
+        .active-shape { color: #00ffcc; text-shadow: 0 0 10px #00ffcc; }
+    </style>
+</head>
+<body>
+    <div id="ui">
+        <div id="gesture-name" style="font-size: 1.2em; margin-bottom: 10px;">Waiting for Camera...</div>
+        <div id="shape-list">
+            <div id="s-heart">❤ 1 Finger: Heart</div>
+            <div id="s-saturn">🪐 2 Fingers: Saturn</div>
+            <div id="s-flower">🌸 3 Fingers: Flower</div>
+            <div id="s-firework">🎆 4+ Fingers: Fireworks</div>
+        </div>
+    </div>
+    <video id="video"></video>
+
+    <script src="https://cdn.jsdelivr.net/npm/three@0.152.0/build/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+
+    <script>
+        let scene, camera, renderer, particles, clock;
+        let handPos = new THREE.Vector3();
+        let expansion = 1, currentShape = 'heart';
+        const PARTICLE_COUNT = 8000;
+
+        // --- 1. SHAPE GENERATORS ---
+        const getShapePos = (index, type, time) => {
+            const i = index / PARTICLE_COUNT;
+            const t = i * Math.PI * 2;
+            
+            if (type === 'heart') {
+                const x = 16 * Math.pow(Math.sin(t), 3);
+                const y = 13 * Math.cos(t) - 5 * Math.cos(2*t) - 2 * Math.cos(3*t) - Math.cos(4*t);
+                return new THREE.Vector3(x * 0.4, y * 0.4, 0);
+            } 
+            else if (type === 'saturn') {
+                if (index % 2 === 0) {
+                    const phi = Math.acos(-1 + (2 * index) / (PARTICLE_COUNT/2));
+                    const theta = Math.sqrt((PARTICLE_COUNT/2) * Math.PI) * phi;
+                    return new THREE.Vector3(4 * Math.cos(theta) * Math.sin(phi), 4 * Math.sin(theta) * Math.sin(phi), 4 * Math.cos(phi));
+                } else {
+                    return new THREE.Vector3(Math.cos(t) * 9, Math.sin(t) * 9, Math.sin(t) * 2);
+                }
+            } 
+            else if (type === 'flower') {
+                const r = 6 * Math.sin(5 * t);
+                return new THREE.Vector3(r * Math.cos(t), r * Math.sin(t), Math.cos(time * 2 + index) * 2);
+            }
+            else { // Firework
+                const r = 10 + Math.random() * 5;
+                return new THREE.Vector3(Math.cos(t * index) * r, Math.sin(t * index) * r, Math.tan(t) * 2);
+            }
+        };
+
+        // --- 2. SETUP SCENE ---
+        function init() {
+            scene = new THREE.Scene();
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.z = 25;
+
+            renderer = new THREE.WebGLRenderer({ 
+                antialias: true,
+                preserveDrawingBuffer: true // Required for trails
+            });
+            renderer.autoClearColor = false; // Prevents clearing the screen every frame
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            document.body.appendChild(renderer.domElement);
+
+            const geo = new THREE.BufferGeometry();
+            const pos = new Float32Array(PARTICLE_COUNT * 3);
+            const colors = new Float32Array(PARTICLE_COUNT * 3);
+
+            geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+            geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+            const mat = new THREE.PointsMaterial({
+                size: 0.12, 
+                vertexColors: true, 
+                transparent: true,
+                opacity: 0.8,
+                blending: THREE.AdditiveBlending,
+                depthWrite: false
+            });
+
+            particles = new THREE.Points(geo, mat);
+            scene.add(particles);
+            clock = new THREE.Clock();
+
+            // Create a semi-transparent dark plane to fade old particles
+            const fadeGeo = new THREE.PlaneGeometry(200, 200);
+            const fadeMat = new THREE.MeshBasicMaterial({
+                color: 0x000000,
+                transparent: true,
+                opacity: 0.15 // Adjust this for trail length (lower = longer trails)
+            });
+            const fadeMesh = new THREE.Mesh(fadeGeo, fadeMat);
+            fadeMesh.position.z = -1; // Place slightly behind current particles
+            camera.add(fadeMesh); 
+            scene.add(camera);
+        }
+
+        // --- 3. AI GESTURES ---
+        function onResults(results) {
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                const landmarks = results.multiHandLandmarks[0];
+                
+                // Track Middle Palm (Landmark 9)
+                handPos.x = (landmarks[9].x - 0.5) * -50;
+                handPos.y = (landmarks[9].y - 0.5) * -30;
+
+                // Pinch detection (Thumb tip 4 to Index tip 8)
+                const dx = landmarks[4].x - landmarks[8].x;
+                const dy = landmarks[4].y - landmarks[8].y;
+                expansion = THREE.MathUtils.lerp(expansion, Math.sqrt(dx*dx + dy*dy) * 20, 0.1);
+
+                // Finger Counting
+                let fingers = 0;
+                [8, 12, 16, 20].forEach(id => { if(landmarks[id].y < landmarks[id-2].y) fingers++; });
+                
+                const prevShape = currentShape;
+                if (fingers <= 1) currentShape = 'heart';
+                else if (fingers === 2) currentShape = 'saturn';
+                else if (fingers === 3) currentShape = 'flower';
+                else currentShape = 'firework';
+
+                if(prevShape !== currentShape) updateUI();
+            }
+        }
+
+        function updateUI() {
+            document.querySelectorAll('#shape-list div').forEach(el => el.className = '');
+            document.getElementById(`s-${currentShape}`).className = 'active-shape';
+            document.getElementById('gesture-name').innerText = `Active: ${currentShape.toUpperCase()}`;
+        }
+
+        // --- 4. ENGINE ---
+        function animate() {
+            requestAnimationFrame(animate);
+            const time = clock.getElapsedTime();
+            const posAttr = particles.geometry.attributes.position;
+            const colAttr = particles.geometry.attributes.color;
+
+            for (let i = 0; i < PARTICLE_COUNT; i++) {
+                const target = getShapePos(i, currentShape, time);
+                
+                const tx = (target.x * expansion) + handPos.x;
+                const ty = (target.y * expansion) + handPos.y;
+                const tz = (target.z * expansion);
+
+                // Movement physics (Lerp)
+                posAttr.array[i*3] += (tx - posAttr.array[i*3]) * 0.08;
+                posAttr.array[i*3+1] += (ty - posAttr.array[i*3+1]) * 0.08;
+                posAttr.array[i*3+2] += (tz - posAttr.array[i*3+2]) * 0.08;
+
+                // Color shifts
+                const color = new THREE.Color().setHSL((time * 0.1 + i/PARTICLE_COUNT) % 1, 0.7, 0.6);
+                colAttr.array[i*3] = color.r;
+                colAttr.array[i*3+1] = color.g;
+                colAttr.array[i*3+2] = color.b;
+            }
+
+            posAttr.needsUpdate = true;
+            colAttr.needsUpdate = true;
+            particles.rotation.z += 0.001;
+
+            renderer.render(scene, camera);
+        }
+
+        // --- 5. INITIALIZE ---
+        init();
+        const hands = new Hands({ locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}` });
+        hands.setOptions({ maxNumHands: 1, modelComplexity: 1, minDetectionConfidence: 0.6 });
+        hands.onResults(onResults);
+
+        const cameraFeed = new Camera(document.getElementById('video'), {
+            onFrame: async () => { await hands.send({image: document.getElementById('video')}); },
+            width: 1280, height: 720
+        });
+        cameraFeed.start();
+        animate();
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+    </script>
+</body>
+</html>
